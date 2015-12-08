@@ -1,6 +1,6 @@
 # Wrapped arround answer of
 #  http://stackoverflow.com/questions/6809590/merging-a-python-scripts-subprocess-stdout-and-stderr-while-keeping-them-disti
-# (T.Rojan)
+# (T.Rojan & J.F.Sebastian)
 
 # Only supposed to work on Linux / Mac
 # Wrapper to check the output of a command (as stream) by line
@@ -10,6 +10,8 @@ import subprocess
 import select
 import psutil
 import time
+import pty
+import os
 
 
 class CMDStream(object):
@@ -26,43 +28,59 @@ class CMDStream(object):
         :param timeout: optional in seconds
         """
         start_time = time.time()
-        tsk = subprocess.Popen(command,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
+        master_fd, slave_fd = pty.openpty()
+        p = subprocess.Popen(command,
+                             stdout=slave_fd,
+                             stderr=subprocess.PIPE)
 
-        poll = select.poll()
-        poll.register(tsk.stdout, select.POLLIN | select.POLLHUP)
-        poll.register(tsk.stderr, select.POLLIN | select.POLLHUP)
-        pollc = 2
-        events = poll.poll()
-        while pollc > 0 and len(events) > 0:
-            # Check for timeout
-            if timeout:
-                if start_time+timeout < time.time():
-                    self.kill(tsk.pid)
+        with os.fdopen(master_fd) as stdout:
+            poll = select.poll()
+            poll.register(stdout, select.POLLIN)
+            poll.register(p.stderr, select.POLLIN | select.POLLHUP)
+
+            def cleanup(_done=[]):
+                if _done:
+                    return
+                _done.append(1)
+                poll.unregister(p.stderr)
+                p.stderr.close()
+                poll.unregister(stdout)
+                assert p.poll() is not None
+
+            while True:
+                events = poll.poll(40)
+                if not events and p.poll() is not None:
+                    # no IO events and the subprocess exited
+                    cleanup()
                     break
-            # Check stdout / stderr
-            for event in events:
-                (rfd, event) = event
-                if event & select.POLLIN:
-                    if rfd == tsk.stdout.fileno():
-                        line = tsk.stdout.readline()
-                        if len(line) > 0:
-                            if self.on_stdout(line[:-1]):
-                                self.kill(tsk.pid)
+
+                # Check for timeout
+                if timeout:
+                    if start_time+timeout < time.time():
+                        self.on_timeout()
+                        self.kill(p.pid)
+                        break
+
+                for fd, event in events:
+                    if event & select.POLLIN:
+                        # there is something to read
+                        if fd == stdout.fileno():
+                            out = stdout.readline().rstrip()
+                            if self.on_stderr(out):
+                                self.kill(p.pid)
                                 break
-                    if rfd == tsk.stderr.fileno():
-                        line = tsk.stderr.readline()
-                        if len(line) > 0:
-                            if self.on_stderr(line[:-1]):
-                                self.kill(tsk.pid)
+                        if fd == p.stderr.fileno():
+                            err = p.stderr.readline().rstrip()
+                            if self.on_stderr(err):
+                                self.kill(p.pid)
                                 break
-                if event & select.POLLHUP:
-                    poll.unregister(rfd)
-                    pollc -= 1
-                if pollc > 0:
-                    events = poll.poll()
-        tsk.wait()
+                    elif event & select.POLLHUP:
+                        # free resources if stderr hung up
+                        cleanup()
+                    else:
+                        # something unexpected happened
+                        assert 0
+        p.wait()
 
     def kill(self, proc_pid):
         # Kills a process and its subs
@@ -72,11 +90,11 @@ class CMDStream(object):
         process.kill()
 
     def on_stdout(self, stdout):
-        print("Stdout: %s" % stdout)
+        print(stdout)
         return False
 
     def on_stderr(self, stderr):
-        print("Stderr:" % stderr)
+        print(stderr)
         return False
 
     def on_timeout(self):
